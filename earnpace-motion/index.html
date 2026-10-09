@@ -1,0 +1,652 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>EarnPace — Set Your Pace</title>
+<style>
+  html,body{margin:0;background:#000;height:100%;overflow:hidden}
+  canvas{display:block;width:100vw;height:56.25vw;max-height:100vh;max-width:177.78vh;margin:auto;position:absolute;inset:0}
+</style>
+</head>
+<body>
+<canvas id="c" width="1920" height="1080"></canvas>
+<script>
+// ---------------------------------------------------------------------------
+// EarnPace — "Set Your Pace". Deterministic: renderFrame(t) draws time t (s).
+// Open with ?play to preview in real time.
+// ---------------------------------------------------------------------------
+const W = 1920, H = 1080, DUR = 18.5, FPS = 60;
+const C = {
+  ink: '#090D0B', deep: '#003024', deeper: '#00211A', accent: '#39C900', accentL: '#7BE04A',
+  bg: '#F5F7F2', panel: '#EAF3E3', border: '#DDE5D6', text: '#111411', link: '#1F6B00', coral: '#FF6B57',
+};
+const DISPLAY = '"Inter Display", Inter, sans-serif';
+const BODY = 'Inter, sans-serif';
+
+// ---- math -----------------------------------------------------------------
+const clamp = (v, a = 0, b = 1) => Math.min(b, Math.max(a, v));
+const lerp = (a, b, t) => a + (b - a) * t;
+const P = (t, a, b) => clamp((t - a) / (b - a));
+const eOut3 = t => 1 - Math.pow(1 - t, 3);
+const eOut5 = t => 1 - Math.pow(1 - t, 5);
+const eIn3 = t => t * t * t;
+const eInOut3 = t => t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+const eInOut5 = t => t < .5 ? 16 * t ** 5 : 1 - Math.pow(-2 * t + 2, 5) / 2;
+const eOutBack = (t, s = 1.70158) => 1 + (s + 1) * Math.pow(t - 1, 3) + s * Math.pow(t - 1, 2);
+const eOutBounce = t => {
+  const n = 7.5625, d = 2.75;
+  if (t < 1 / d) return n * t * t;
+  if (t < 2 / d) return n * (t -= 1.5 / d) * t + .75;
+  if (t < 2.5 / d) return n * (t -= 2.25 / d) * t + .9375;
+  return n * (t -= 2.625 / d) * t + .984375;
+};
+function rng(seed) { return () => { seed |= 0; seed = seed + 0x6D2B79F5 | 0; let t = Math.imul(seed ^ seed >>> 15, 1 | seed); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+const hex = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
+const mix = (a, b, t, al = 1) => { const A = hex(a), B = hex(b); return `rgba(${A.map((v, i) => Math.round(lerp(v, B[i], t))).join(',')},${al})`; };
+const rgba = (h, a) => mix(h, h, 0, a);
+
+// ---- timeline -------------------------------------------------------------
+const Y0 = 620;                // the line's resting height (world = screen in scenes 1–2)
+const X0 = 1100, D = 560, R = 260;  // staircase origin, run, rise
+const ARR = [6.6, 8.1, 9.6, 11.1];  // dot lands on step i
+const HOP = 0.55;
+const DOT_R = 16;
+const treadC = i => [X0 + i * D + D / 2, Y0 - (i + 1) * R];
+const barH = i => i < 4 ? (i + 1) * R : 4 * R * Math.pow(1.2, i - 3);
+const NB = 10;
+
+// camera: world point at screen centre + scale
+const CAM_STEP = i => { const [x, y] = treadC(i); return { x: x - 380, y: y - 220, s: 1 }; };
+const CAM_CHART = { x: X0 + NB * D / 2, y: Y0 - 420 / 0.25, s: 0.25 };
+const camSegs = (() => {
+  const segs = []; let prev = { x: 960, y: 540, s: 1 };
+  ARR.forEach((a, i) => { const to = CAM_STEP(i); segs.push({ t0: a - HOP - .05, t1: a + .3, from: prev, to, ease: eInOut3 }); prev = to; });
+  segs.push({ t0: 11.8, t1: 12.95, from: prev, to: CAM_CHART, ease: eInOut5 });
+  return segs;
+})();
+function cam(t) {
+  let c = { x: 960, y: 540, s: 1 };
+  for (const g of camSegs) {
+    if (t < g.t0) break;
+    const k = g.ease(P(t, g.t0, g.t1));
+    // zoom interpolated in log space; centre follows screen-space-consistent path
+    const s = Math.exp(lerp(Math.log(g.from.s), Math.log(g.to.s), k));
+    const w = g.from.s === g.to.s ? k : (1 / s - 1 / g.from.s) / (1 / g.to.s - 1 / g.from.s);
+    c = { x: lerp(g.from.x, g.to.x, w), y: lerp(g.from.y, g.to.y, w), s };
+  }
+  if (t > 12.95) c.s *= 1 + .035 * eInOut3(P(t, 12.95, 15.2)); // slow push-in
+  return c;
+}
+const toScreen = (c, x, y) => [(x - c.x) * c.s + 960, (y - c.y) * c.s + 540];
+const applyCam = (ctx, c) => ctx.setTransform(c.s, 0, 0, c.s, 960 - c.x * c.s, 540 - c.y * c.s);
+
+// ---- scene 1 ticker -------------------------------------------------------
+const damp = t => 1 - eInOut3(P(t, 2.85, 3.75));
+function tickerY(x, t) {
+  const d = damp(t), ph = t;
+  const n = Math.sin(x * .011 + ph * 3.1) * .5 + Math.sin(x * .029 - ph * 5.3) * .32 + Math.sin(x * .067 + ph * 8.2) * .18;
+  return Y0 + (x / W - .2) * 260 * d + n * 95 * d;
+}
+const headX = t => t < 2.85 ? lerp(-60, 1540, eOut5(P(t, .1, 1.7))) : lerp(1540, 760, eInOut3(P(t, 2.85, 3.75)));
+
+// ---- curve over the bars (scene 4) ---------------------------------------
+const curvePts = (() => {
+  const pts = [];
+  for (let i = 0; i < NB; i++) pts.push([X0 + i * D + D / 2, Y0 - barH(i)]);
+  // Catmull-Rom → dense polyline
+  const out = [];
+  for (let i = 0; i < pts.length - 1; i++) {
+    const p0 = pts[Math.max(0, i - 1)], p1 = pts[i], p2 = pts[i + 1], p3 = pts[Math.min(pts.length - 1, i + 2)];
+    for (let k = 0; k < 40; k++) {
+      const u = k / 40, u2 = u * u, u3 = u2 * u;
+      out.push([0, 1].map(j => .5 * ((2 * p1[j]) + (-p0[j] + p2[j]) * u + (2 * p0[j] - 5 * p1[j] + 4 * p2[j] - p3[j]) * u2 + (-p0[j] + 3 * p1[j] - 3 * p2[j] + p3[j]) * u3)));
+    }
+  }
+  out.push(pts[pts.length - 1]);
+  let L = 0; const cum = [0];
+  for (let i = 1; i < out.length; i++) { L += Math.hypot(out[i][0] - out[i - 1][0], out[i][1] - out[i - 1][1]); cum.push(L); }
+  return { pts: out, cum, L };
+})();
+function curveAt(f) {
+  const target = f * curvePts.L, { pts, cum } = curvePts;
+  let i = 1; while (i < cum.length - 1 && cum[i] < target) i++;
+  const k = (target - cum[i - 1]) / ((cum[i] - cum[i - 1]) || 1);
+  return { i, p: [lerp(pts[i - 1][0], pts[i][0], k), lerp(pts[i - 1][1], pts[i][1], k)] };
+}
+const curveProg = t => eInOut3(P(t, 12.45, 14.25));
+const dotCatch = (() => { // curve fraction where the dot (on step 4) gets picked up
+  const tx = treadC(3)[0]; let i = 0; while (curvePts.pts[i][0] < tx) i++; return curvePts.cum[i] / curvePts.L;
+})();
+
+// ---- the dot ---------------------------------------------------------------
+function dotWorld(t) {
+  if (t < ARR[0] - HOP) { const x = headX(t); return { x, y: tickerY(x, t), sx: 1, sy: 1 }; }
+  for (let i = 0; i < 4; i++) {
+    const a = ARR[i], s = a - HOP;
+    const from = i === 0 ? [760, Y0] : [treadC(i - 1)[0], treadC(i - 1)[1] - DOT_R - 3];
+    const to = [treadC(i)[0], treadC(i)[1] - DOT_R - 3];
+    if (t < a) {
+      const p = eInOut3(P(t, s, a)), arc = Math.sin(Math.PI * P(t, s, a));
+      return { x: lerp(from[0], to[0], p), y: lerp(from[1], to[1], p) - arc * 150, sx: 1 - .12 * arc, sy: 1 + .18 * arc };
+    }
+    if (i === 3 || t < ARR[i + 1] - HOP) {
+      const dt = t - a, amt = dt < .6 ? Math.exp(-dt * 9) * Math.cos(dt * 28) : 0;
+      let x = to[0], y = to[1];
+      if (i === 3) {
+        const f = curveProg(t);
+        if (f > dotCatch) { const q = curveAt(f).p; x = q[0]; y = q[1]; }
+      }
+      return { x, y, sx: 1 + .38 * amt, sy: 1 - .38 * amt, land: dt };
+    }
+  }
+}
+
+// ---- text helper: masked word-by-word reveal -------------------------------
+// items: [{text, font, color}], o: {t, t0, st, dur, ex, exDur, size, align}
+function words(ctx, items, x, y, o) {
+  const space = [];
+  let total = 0;
+  items.forEach((it, i) => {
+    ctx.font = it.font;
+    it.w = ctx.measureText(it.text).width;
+    space[i] = ctx.measureText(' ').width * (it.tight ? 0 : 1);
+    total += it.w + (i < items.length - 1 ? space[i] : 0);
+  });
+  let cx = o.align === 'center' ? x - total / 2 : x;
+  const sz = o.size;
+  items.forEach((it, i) => {
+    const p = eOut5(P(o.t, o.t0 + i * o.st, o.t0 + i * o.st + o.dur));
+    const e = o.ex != null ? eIn3(P(o.t, o.ex + i * .04, o.ex + i * .04 + (o.exDur || .4))) : 0;
+    if (p > 0 && e < 1) {
+      ctx.save();
+      ctx.beginPath(); ctx.rect(cx - sz * .2, y - sz * 1.02, it.w + sz * .4, sz * 1.32); ctx.clip();
+      ctx.font = it.font; ctx.fillStyle = it.color;
+      const dy = (1 - p) * sz * 1.1 - e * sz * 1.1;
+      const dx = it.slide ? (1 - p) * it.slide : 0;
+      ctx.translate(cx + dx, y + dy);
+      if (it.skew) ctx.transform(1, 0, -it.skew * (1 - p), 1, 0, 0);
+      ctx.fillText(it.text, 0, 0);
+      ctx.restore();
+    }
+    cx += it.w + space[i];
+  });
+  return total;
+}
+const line = (str, font, color, extra = {}) => str.split(' ').map(w => ({ text: w, font, color, ...extra }));
+
+// ---- background ------------------------------------------------------------
+function background(ctx, t, c) {
+  const k = eInOut3(P(t, 2.85, 3.75));
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = mix(C.ink, C.deeper, k); ctx.fillRect(0, 0, W, H);
+  // soft light pool that drifts with the story
+  const gx = lerp(1300, 1100, P(t, 0, 15)), gy = lerp(500, 400, P(t, 0, 15));
+  const g = ctx.createRadialGradient(gx, gy, 0, gx, gy, 1100);
+  g.addColorStop(0, k > 0 ? mix('#1a1f1c', '#0B4A37', k, .9) : 'rgba(40,46,43,.9)');
+  g.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  // world grid (fades in with the calm)
+  const ga = .055 * k;
+  if (ga > 0) {
+    applyCam(ctx, c);
+    const x0 = c.x - 960 / c.s, x1 = c.x + 960 / c.s, y0 = c.y - 540 / c.s, y1 = c.y + 540 / c.s;
+    [[120, clamp((c.s - .32) / .35)], [480, 1]].forEach(([sp, a]) => {
+      if (a <= 0) return;
+      ctx.strokeStyle = `rgba(160,255,120,${ga * a * (sp === 480 ? 1.3 : 1)})`;
+      ctx.lineWidth = 1.2 / c.s;
+      ctx.beginPath();
+      for (let x = Math.floor(x0 / sp) * sp; x <= x1; x += sp) { ctx.moveTo(x, y0); ctx.lineTo(x, y1); }
+      for (let y = Math.floor(y0 / sp) * sp; y <= y1; y += sp) { ctx.moveTo(x0, y); ctx.lineTo(x1, y); }
+      ctx.stroke();
+    });
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+  }
+}
+
+// ---- scene 1 extras ---------------------------------------------------------
+const CHIPS = (() => {
+  const r = rng(7), labels = ['−$4.89  coffee', '−$1,450  rent', '−$15.99  streaming', '−$62.10  groceries', '−$89  phone', '−$38  gas',
+    '−$120  card min.', '−$9.99  app', '−$210  car', '−$24  delivery', '−$55  utilities', '−$12  fees', '−$140  insurance', '−$7.50  lunch', '−$30  gym', '−$18  ride'];
+  return labels.map((l, i) => {
+    const band = r() < .3 ? [70, 190] : [690, 1010];
+    return { l, t0: .15 + i * .155 + r() * .1, y: lerp(band[0], band[1], r()), z: .65 + r() * .55, dur: 1.5 + r() * .7 };
+  });
+})();
+const STREAKS = (() => { const r = rng(3); return Array.from({ length: 26 }, () => ({ y: r() * H, len: 180 + r() * 420, v: 1700 + r() * 1900, off: r() * 4000, a: .04 + r() * .06 })); })();
+
+function scene1(ctx, t) {
+  if (t > 3.9) return;
+  const fade = 1 - P(t, 2.75, 3.4);
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  // speed streaks
+  STREAKS.forEach(s => {
+    const x = W + 600 - ((t * s.v + s.off) % (W + 1400));
+    const g = ctx.createLinearGradient(x, 0, x + s.len, 0);
+    g.addColorStop(0, `rgba(255,255,255,${s.a * fade})`); g.addColorStop(1, 'rgba(255,255,255,0)');
+    ctx.fillStyle = g; ctx.fillRect(x, s.y, s.len, 2);
+  });
+  // expense chips flying left
+  CHIPS.forEach(ch => {
+    const p = (t - ch.t0) / ch.dur; if (p < 0 || p > 1) return;
+    const x = lerp(W + 200, -500, eInOut3(p) * .35 + p * .65);
+    const sc = ch.z, a = (ch.z - .4) * fade * clamp(p * 6) * clamp((1 - p) * 6);
+    ctx.save(); ctx.translate(x, ch.y); ctx.scale(sc, sc);
+    ctx.font = `600 30px ${BODY}`;
+    const w = ctx.measureText(ch.l).width + 56;
+    const g = ctx.createLinearGradient(w, 0, w + 260, 0);
+    g.addColorStop(0, `rgba(255,107,87,${.25 * a})`); g.addColorStop(1, 'rgba(255,107,87,0)');
+    ctx.fillStyle = g; ctx.fillRect(w - 10, 26, 260, 4);
+    ctx.fillStyle = `rgba(255,255,255,${.07 * a})`; ctx.strokeStyle = `rgba(255,255,255,${.22 * a})`; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.roundRect(0, 0, w, 58, 29); ctx.fill(); ctx.stroke();
+    ctx.fillStyle = `rgba(255,107,87,${a})`; ctx.beginPath(); ctx.arc(26, 29, 6, 0, 7); ctx.fill();
+    ctx.fillStyle = `rgba(255,255,255,${.85 * a})`; ctx.fillText(ch.l, 42, 40);
+    ctx.restore();
+  });
+  // headline
+  const F1 = `900 150px ${DISPLAY}`;
+  words(ctx, [...line('Money moves', F1, '#fff'), { text: 'fast.', font: F1, color: C.coral, slide: 260, skew: .35 }],
+    150, 380, { t, t0: .35, st: .13, dur: .7, ex: 2.75, exDur: .42, size: 150 });
+  words(ctx, line('Most of us are just chasing it.', `500 54px ${BODY}`, 'rgba(255,255,255,.72)'),
+    156, 470, { t, t0: 1.15, st: .055, dur: .6, ex: 2.82, exDur: .38, size: 54 });
+}
+
+// ---- line / stairs (world) -------------------------------------------------
+function stairPath(ctx, m) {
+  ctx.moveTo(-4000, Y0); ctx.lineTo(X0, Y0);
+  for (let i = 0; i < 4; i++) {
+    const x = X0 + i * D;
+    ctx.lineTo(x, Y0 - (i + 1) * R * m);
+    ctx.lineTo(x + D, Y0 - (i + 1) * R * m);
+  }
+  ctx.lineTo(X0 + 4 * D + 500 * (1 - m), Y0 - 4 * R * m);
+}
+
+function theLine(ctx, t, c, dot) {
+  const col = mix(C.coral, C.accent, eInOut3(P(t, 2.9, 3.5)));
+  if (t < 3.75) {
+    // ticker (screen == world here)
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    const hx = headX(t), step = lerp(34, 6, 1 - damp(t));
+    ctx.beginPath();
+    for (let x = -60; x <= hx; x += step) ctx.lineTo(x, tickerY(x, t));
+    ctx.lineTo(hx, tickerY(hx, t));
+    ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+    ctx.shadowColor = col; ctx.shadowBlur = 24; ctx.strokeStyle = col; ctx.lineWidth = 5; ctx.stroke();
+    ctx.shadowBlur = 0;
+    // future path fading in during calm
+    const fa = P(t, 3.0, 3.75);
+    if (fa > 0) {
+      ctx.beginPath(); ctx.moveTo(hx, tickerY(hx, t)); ctx.lineTo(W + 50, tickerY(W + 50, t));
+      ctx.strokeStyle = rgba(C.accent, .3 * fa); ctx.lineWidth = 5; ctx.stroke();
+    }
+    return;
+  }
+  const m = eInOut5(P(t, 5.75, 6.45));
+  applyCam(ctx, c);
+  ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+  const fadeStairs = 1 - .65 * P(t, 11.95, 12.6);
+  // dim future path
+  ctx.beginPath(); stairPath(ctx, m);
+  ctx.strokeStyle = rgba(C.accent, .3 * fadeStairs); ctx.lineWidth = 5 / Math.max(c.s, .5); ctx.stroke();
+  // lit path behind the dot
+  ctx.save();
+  ctx.beginPath(); ctx.rect(-5000, -9000, dot.x + 5000, 20000); ctx.clip();
+  ctx.beginPath(); stairPath(ctx, m);
+  ctx.shadowColor = C.accent; ctx.shadowBlur = 22 * c.s;
+  ctx.strokeStyle = rgba(C.accent, fadeStairs); ctx.lineWidth = 6 / Math.max(c.s, .5); ctx.stroke();
+  ctx.restore();
+  // tread highlight sweep on landing
+  ARR.forEach((a, i) => {
+    const p = eOut3(P(t, a, a + .5)); if (p <= 0) return;
+    const [tx, ty] = treadC(i);
+    ctx.beginPath(); ctx.moveTo(tx - D / 2 * p, ty); ctx.lineTo(tx + D / 2 * p, ty);
+    ctx.strokeStyle = rgba('#C8FFA8', (1 - P(t, a + .3, a + 1.4)) * .9 * fadeStairs); ctx.lineWidth = 9; ctx.stroke();
+  });
+  // track ticks under the flat line (scene 2)
+  const ta = P(t, 3.2, 3.9) * (1 - P(t, 5.9, 6.4));
+  if (ta > 0) {
+    ctx.fillStyle = `rgba(200,255,170,${.28 * ta})`;
+    const off = (t * 110) % 60;
+    for (let x = -off; x < X0; x += 60) ctx.fillRect(x, Y0 + 18, 2, x % 300 < 60 ? 22 : 12);
+  }
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+}
+
+// ---- icons ------------------------------------------------------------------
+function coin(ctx, x, y, a) {
+  ctx.save(); ctx.translate(x, y); ctx.globalAlpha *= a;
+  ctx.fillStyle = C.link; ctx.beginPath(); ctx.ellipse(0, 10, 64, 20, 0, 0, Math.PI); ctx.lineTo(-64, 0); ctx.ellipse(0, 0, 64, 20, 0, Math.PI, 0, true); ctx.fill();
+  ctx.fillRect(-64, 0, 128, 10);
+  ctx.fillStyle = C.accent; ctx.beginPath(); ctx.ellipse(0, 0, 64, 20, 0, 0, 7); ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,.45)'; ctx.lineWidth = 3; ctx.beginPath(); ctx.ellipse(0, 0, 46, 13, 0, 0, 7); ctx.stroke();
+  ctx.scale(1, .32); ctx.fillStyle = C.deep; ctx.font = `800 52px ${DISPLAY}`; ctx.textAlign = 'center'; ctx.fillText('$', 0, 18);
+  ctx.restore();
+}
+function iconEarn(ctx, q) {
+  for (let k = 0; k < 3; k++) {
+    const p = P(q, k * .14, k * .14 + .55);
+    if (p <= 0) continue;
+    coin(ctx, 0, lerp(-300, 70 - k * 30, eOutBounce(p)), clamp(p * 5));
+  }
+  // sparkle
+  const sp = P(q, .7, 1.1);
+  if (sp > 0 && sp < 1) {
+    ctx.save(); ctx.translate(58, -20); ctx.rotate(sp * 1.5); ctx.globalAlpha *= Math.sin(Math.PI * sp);
+    ctx.fillStyle = '#fff'; ctx.beginPath();
+    for (let i = 0; i < 8; i++) { const r = i % 2 ? 6 : 22; ctx.lineTo(Math.cos(i * Math.PI / 4) * r, Math.sin(i * Math.PI / 4) * r); }
+    ctx.fill(); ctx.restore();
+  }
+}
+function iconSave(ctx, q) {
+  const s = eOutBack(P(q, 0, .45)); if (s <= 0) return;
+  ctx.save(); ctx.scale(s, s);
+  // coin dropping in
+  const cp = P(q, .2, .55);
+  if (cp > 0 && cp < 1) { ctx.save(); ctx.scale(.5, .5); coin(ctx, 0, lerp(-420, 60, eIn3(cp)), 1); ctx.restore(); }
+  ctx.save(); ctx.beginPath(); ctx.roundRect(-74, -78, 148, 168, 30); ctx.clip();
+  const lev = 30 + 105 * eOut3(P(q, .45, 1.2));
+  ctx.fillStyle = C.accent; ctx.beginPath(); ctx.moveTo(-80, 100);
+  for (let x = -80; x <= 80; x += 8) ctx.lineTo(x, 90 - lev + Math.sin(x * .07 + q * 7) * 6 * (1 - P(q, 1.1, 1.6) * .7));
+  ctx.lineTo(80, 100); ctx.fill();
+  ctx.fillStyle = 'rgba(255,255,255,.18)'; ctx.fillRect(-50, -60, 14, 130);
+  ctx.restore();
+  ctx.strokeStyle = '#fff'; ctx.lineWidth = 7; ctx.beginPath(); ctx.roundRect(-74, -78, 148, 168, 30); ctx.stroke();
+  ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.roundRect(-60, -104, 120, 22, 8); ctx.fill();
+  ctx.fillStyle = C.deep; ctx.fillRect(-22, -97, 44, 7);
+  ctx.restore();
+}
+function iconManage(ctx, q) {
+  const s = eOutBack(P(q, 0, .45)); if (s <= 0) return;
+  ctx.save(); ctx.scale(s, s); ctx.rotate((1 - eOut3(P(q, 0, 1))) * -1.2);
+  const fr = [.4, .27, .19, .14], cols = [C.accent, '#BDF7A0', C.link, '#7BE04A'];
+  const sw = eOut3(P(q, .05, .9)) * Math.PI * 2;
+  let a0 = -Math.PI / 2;
+  ctx.lineWidth = 38; ctx.lineCap = 'butt';
+  fr.forEach((f, i) => {
+    const a1 = a0 + f * Math.PI * 2, end = Math.min(a1 - .06, -Math.PI / 2 + sw);
+    if (end > a0) { ctx.strokeStyle = cols[i]; ctx.beginPath(); ctx.arc(0, 0, 78, a0, end); ctx.stroke(); }
+    a0 = a1;
+  });
+  ctx.restore();
+  const cp = eOutBack(P(q, .6, .95));
+  if (cp > 0) { ctx.save(); ctx.scale(cp, cp); ctx.fillStyle = '#fff'; ctx.font = `800 44px ${DISPLAY}`; ctx.textAlign = 'center'; ctx.fillText('$', 0, 16); ctx.restore(); }
+}
+function iconGrow(ctx, q) {
+  const g = eOut3(P(q, 0, .7)); if (g <= 0) return;
+  ctx.strokeStyle = 'rgba(255,255,255,.5)'; ctx.lineWidth = 6; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(-70 * g, 92); ctx.lineTo(70 * g, 92); ctx.stroke();
+  const top = 92 - 170 * g;
+  ctx.strokeStyle = C.accent; ctx.lineWidth = 10;
+  ctx.beginPath(); ctx.moveTo(0, 92); ctx.quadraticCurveTo(-24, 92 - 85 * g, 0, top); ctx.stroke();
+  const leaf = (sgn, d, size) => {
+    const p = eOutBack(P(q, d, d + .45), 2.2); if (p <= 0) return;
+    ctx.save(); ctx.translate(0, top + 40 + (sgn > 0 ? 18 : -10)); ctx.rotate(sgn * -.5); ctx.scale(sgn * p * size, p * size);
+    ctx.fillStyle = sgn > 0 ? C.accent : C.accentL;
+    ctx.beginPath(); ctx.moveTo(0, 0); ctx.bezierCurveTo(30, -50, 90, -50, 110, -20); ctx.bezierCurveTo(80, 10, 30, 14, 0, 0); ctx.fill();
+    ctx.restore();
+  };
+  leaf(1, .35, .8); leaf(-1, .5, .62);
+  const bp = eOutBack(P(q, .65, 1.0)); if (bp > 0) { ctx.fillStyle = '#C8FFA8'; ctx.beginPath(); ctx.arc(0, top - 8, 12 * bp, 0, 7); ctx.fill(); }
+}
+const ICONS = [iconEarn, iconSave, iconManage, iconGrow];
+
+function stairIcons(ctx, t, c) {
+  const fadeOut = 1 - P(t, 11.85, 12.25);
+  if (fadeOut <= 0) return;
+  ARR.forEach((a, i) => {
+    const q = t - a; if (q <= 0) return;
+    const [tx, ty] = treadC(i);
+    const [sx, sy] = toScreen(c, tx, ty - 175);
+    ctx.save(); ctx.setTransform(c.s, 0, 0, c.s, sx, sy);
+    ctx.globalAlpha = fadeOut * (i < 3 ? 1 - .55 * P(t, ARR[i + 1] - .2, ARR[i + 1] + .3) : 1);
+    ICONS[i](ctx, q);
+    ctx.restore();
+  });
+}
+
+// ---- scene 2 + 3 + 4 text -------------------------------------------------------
+const STEPS = [['Earn', 'a little more.'], ['Save', 'it first.'], ['Manage', 'every dollar.'], ['Grow', 'it over time.']];
+function texts(ctx, t) {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  if (t > 3.4 && t < 6.3) {
+    const F = `900 150px ${DISPLAY}`;
+    words(ctx, line('So stop chasing.', F, '#fff'), 150, 380, { t, t0: 3.62, st: .12, dur: .7, ex: 5.62, exDur: .4, size: 150 });
+    words(ctx, [...line('Set your', F, '#fff'), { text: 'pace.', font: F, color: C.accent }], 150, 535,
+      { t, t0: 4.3, st: .14, dur: .75, ex: 5.7, exDur: .4, size: 150 });
+  }
+  STEPS.forEach(([a, b], i) => {
+    const t0 = ARR[i] - .2, ex = i < 3 ? ARR[i + 1] - .62 : 11.72;
+    if (t < t0 - .1 || t > ex + .7) return;
+    ctx.save(); ctx.letterSpacing = '6px';
+    words(ctx, [{ text: `0${i + 1}`, font: `800 30px ${BODY}`, color: C.accent }, { text: '/ 04', font: `600 30px ${BODY}`, color: 'rgba(255,255,255,.45)' }],
+      156, 300, { t, t0: t0 - .05, st: .05, dur: .5, ex, exDur: .35, size: 30 });
+    ctx.restore();
+    words(ctx, [{ text: a, font: `900 180px ${DISPLAY}`, color: '#fff' }], 146, 470, { t, t0, st: 0, dur: .7, ex: ex + .03, exDur: .4, size: 180 });
+    words(ctx, line(b, `700 74px ${DISPLAY}`, 'rgba(255,255,255,.72)'), 152, 570, { t, t0: t0 + .14, st: .07, dur: .6, ex: ex + .06, exDur: .38, size: 74 });
+    // progress pips
+    const pa = P(t, t0, t0 + .3) * (1 - P(t, ex, ex + .3));
+    for (let k = 0; k < 4; k++) {
+      ctx.fillStyle = k <= i ? rgba(C.accent, pa) : `rgba(255,255,255,${.2 * pa})`;
+      const w = k === i ? 64 : 22;
+      ctx.beginPath(); ctx.roundRect(156 + k * 34 + (k > i ? 42 : 0), 640, w, 8, 4); ctx.fill();
+    }
+  });
+  if (t > 12.4 && t < 15.2) {
+    const F = `900 150px ${DISPLAY}`;
+    words(ctx, line('Step by step,', F, '#fff'), 150, 330, { t, t0: 12.75, st: .12, dur: .75, ex: 14.5, exDur: .38, size: 150 });
+    words(ctx, line('it adds up.', F, C.accent), 150, 485, { t, t0: 13.15, st: .13, dur: .75, ex: 14.56, exDur: .38, size: 150 });
+  }
+}
+
+// ---- bars + curve (scene 4) -------------------------------------------------
+function chart(ctx, t, c) {
+  if (t < 11.9 || t > 15.6) return;
+  applyCam(ctx, c);
+  const fb = eOut3(P(t, 11.95, 12.7)), gap = 50 * fb;
+  // baseline
+  ctx.strokeStyle = rgba(C.accent, .35 * P(t, 12, 12.6)); ctx.lineWidth = 3 / c.s;
+  ctx.beginPath(); ctx.moveTo(X0 - 200, Y0); ctx.lineTo(X0 + NB * D * eOut3(P(t, 12, 13)) + 200, Y0); ctx.stroke();
+  for (let i = 0; i < NB; i++) {
+    let h, a;
+    if (i < 4) { h = barH(i); a = fb; } else { const p = P(t, 12.2 + (i - 4) * .11, 12.2 + (i - 4) * .11 + .7); h = barH(i) * eOutBack(p, 1.3); a = clamp(p * 4); }
+    if (a <= 0 || h <= 0) continue;
+    const x = X0 + i * D + gap, w = D - 2 * gap, y = Y0 - h;
+    const g = ctx.createLinearGradient(0, y, 0, Y0);
+    g.addColorStop(0, rgba(C.accent, .62 * a)); g.addColorStop(1, rgba(C.accent, .06 * a));
+    ctx.fillStyle = g; ctx.beginPath(); ctx.roundRect(x, y, w, h, [28, 28, 0, 0]); ctx.fill();
+    ctx.fillStyle = rgba('#D6FFC2', .9 * a); ctx.fillRect(x, y, w, 10);
+  }
+  // curve
+  const f = curveProg(t);
+  if (f > 0) {
+    const { i } = curveAt(f), pts = curvePts.pts, head = curveAt(f).p;
+    ctx.beginPath(); ctx.moveTo(pts[0][0], pts[0][1]);
+    for (let k = 1; k < i; k++) ctx.lineTo(pts[k][0], pts[k][1]);
+    ctx.lineTo(head[0], head[1]);
+    ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+    ctx.shadowColor = C.accent; ctx.shadowBlur = 30;
+    ctx.strokeStyle = '#E6FFD9'; ctx.lineWidth = 7 / c.s; ctx.stroke();
+    ctx.shadowBlur = 0;
+  }
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+}
+
+// ---- dot ----------------------------------------------------------------------
+function drawDot(ctx, t, c) {
+  if (t > 15.3) return;
+  const d = dotWorld(t);
+  const [x, y] = toScreen(c, d.x, d.y);
+  const col = mix(C.coral, C.accent, eInOut3(P(t, 2.9, 3.5)));
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  // metronome pulses (scene 2)
+  for (let k = 0; k < 4; k++) {
+    const pt = 3.95 + k * .6, p = P(t, pt, pt + .9);
+    if (p > 0 && p < 1) { ctx.strokeStyle = rgba(C.accent, (1 - p) * .6); ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(x, y, DOT_R + eOut3(p) * 70, 0, 7); ctx.stroke(); }
+  }
+  // landing rings + particles
+  if (d.land != null && d.land < .9) {
+    const p = d.land / .9;
+    ctx.strokeStyle = `rgba(200,255,170,${(1 - p) * .8})`; ctx.lineWidth = 4;
+    ctx.beginPath(); ctx.ellipse(x, y + DOT_R, 20 + eOut3(p) * 150, 6 + eOut3(p) * 30, 0, 0, 7); ctx.stroke();
+    const r = rng(Math.round(d.x));
+    for (let k = 0; k < 10; k++) {
+      const ang = -Math.PI * (r() * .9 + .05), sp = 120 + r() * 220, pp = eOut3(Math.min(1, p * 1.6));
+      ctx.fillStyle = `rgba(200,255,170,${(1 - p)})`;
+      ctx.fillRect(x + Math.cos(ang) * sp * pp, y + DOT_R + Math.sin(ang) * sp * pp + p * p * 60, 6, 6);
+    }
+  }
+  // final flash
+  const fl = P(t, 14.3, 14.8), flash = Math.sin(Math.PI * fl);
+  const sc = 1 + flash * .9;
+  ctx.save(); ctx.translate(x, y); ctx.scale(d.sx * sc, d.sy * sc);
+  ctx.shadowColor = col; ctx.shadowBlur = 30;
+  ctx.fillStyle = col; ctx.beginPath(); ctx.arc(0, 0, DOT_R, 0, 7); ctx.fill();
+  ctx.shadowBlur = 0; ctx.fillStyle = 'rgba(255,255,255,.85)'; ctx.beginPath(); ctx.arc(-4, -4, 6, 0, 7); ctx.fill();
+  ctx.restore();
+  return [x, y];
+}
+
+// ---- scene 5: brand ------------------------------------------------------------
+function logoMark(ctx, t, size) {
+  const s = eOutBack(P(t, 15.2, 15.75), 1.6); if (s <= 0) return;
+  ctx.save(); ctx.scale(s * size / 180, s * size / 180); ctx.rotate((1 - eOut3(P(t, 15.2, 15.8))) * -.35);
+  ctx.fillStyle = C.deep; ctx.beginPath(); ctx.roundRect(-90, -90, 180, 180, 46); ctx.fill();
+  const dp = eInOut3(P(t, 15.45, 16.0));
+  ctx.strokeStyle = '#fff'; ctx.lineWidth = 13; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+  ctx.setLineDash([400]); ctx.lineDashOffset = 400 * (1 - dp);
+  ctx.beginPath(); ctx.moveTo(-58, 50); ctx.lineTo(-22, 50); ctx.lineTo(-22, 14); ctx.lineTo(14, 14); ctx.lineTo(14, -22); ctx.lineTo(56, -22); ctx.stroke();
+  ctx.setLineDash([]);
+  const pp = eOutBack(P(t, 15.9, 16.25), 2.5);
+  if (pp > 0) { ctx.fillStyle = C.accent; ctx.beginPath(); ctx.arc(35, -48, 15 * pp, 0, 7); ctx.fill(); }
+  ctx.restore();
+}
+
+function scene5(ctx, t, origin) {
+  const rp = eInOut3(P(t, 14.65, 15.45));
+  if (rp <= 0) return;
+  const [ox, oy] = origin;
+  const rad = rp * 2500;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.save();
+  ctx.beginPath(); ctx.arc(ox, oy, rad, 0, 7); ctx.clip();
+  ctx.fillStyle = C.bg; ctx.fillRect(0, 0, W, H);
+  // soft brand glows + grid
+  [[380, 860, 700, .16], [1600, 200, 600, .12]].forEach(([x, y, r, a]) => {
+    const g = ctx.createRadialGradient(x, y, 0, x, y, r); g.addColorStop(0, rgba(C.accent, a)); g.addColorStop(1, rgba(C.accent, 0));
+    ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  });
+  ctx.strokeStyle = rgba(C.border, .9); ctx.lineWidth = 1.5; ctx.beginPath();
+  const go = (t - 15) * 14;
+  for (let x = -go % 120; x < W; x += 120) { ctx.moveTo(x, 0); ctx.lineTo(x, H); }
+  for (let y = 0; y < H; y += 120) { ctx.moveTo(0, y); ctx.lineTo(W, y); }
+  ctx.stroke();
+  // faint journey stair across the bottom
+  const jp = eInOut3(P(t, 15.3, 16.8));
+  if (jp > 0) {
+    ctx.save(); ctx.beginPath(); ctx.rect(0, 0, W * jp, H); ctx.clip();
+    ctx.strokeStyle = rgba(C.accent, .35); ctx.lineWidth = 5; ctx.lineJoin = 'round';
+    ctx.beginPath(); ctx.moveTo(0, 1010);
+    for (let i = 0; i < 6; i++) { const x = 260 + i * 300, y = 1010 - i * 26; ctx.lineTo(x, y); ctx.lineTo(x, y - 26); }
+    ctx.lineTo(W, 1010 - 6 * 26); ctx.stroke(); ctx.restore();
+  }
+  // brand lockup with slow drift
+  const drift = 1 + .025 * eInOut3(P(t, 15.3, DUR));
+  ctx.translate(960, 540); ctx.scale(drift, drift); ctx.translate(-960, -540);
+  const WF = `900 176px ${DISPLAY}`;
+  ctx.font = WF; ctx.letterSpacing = '-4px';
+  const wE = ctx.measureText('Earn').width, wP = ctx.measureText('Pace').width;
+  const mark = 176, gap = 44, total = mark + gap + wE + wP;
+  const left = 960 - total / 2, cy = 420;
+  ctx.save(); ctx.translate(left + mark / 2, cy); logoMark(ctx, t, mark); ctx.restore();
+  // letters rise
+  const letters = [...'EarnPace'];
+  let lx = left + mark + gap; const base = cy + 64;
+  ctx.save(); ctx.beginPath(); ctx.rect(lx - 20, cy - 140, wE + wP + 60, 240); ctx.clip();
+  letters.forEach((ch, i) => {
+    ctx.font = WF; const w = ctx.measureText(ch).width;
+    const p = eOut5(P(t, 15.55 + i * .045, 15.55 + i * .045 + .65));
+    ctx.fillStyle = i < 4 ? C.deep : C.accent;
+    ctx.fillText(ch, lx, base + (1 - p) * 210);
+    lx += w;
+  });
+  ctx.restore();
+  ctx.letterSpacing = '0px';
+  // tagline
+  const TF = `500 50px ${BODY}`, TB = `700 50px ${BODY}`;
+  words(ctx, [...line('Make, save, manage and grow your money —', TF, rgba(C.text, .78)), ...line('at your pace.', TB, C.link)],
+    960, 640, { t, t0: 16.3, st: .05, dur: .6, size: 50, align: 'center' });
+  // url pill
+  const up = eOutBack(P(t, 17.0, 17.45), 1.8);
+  if (up > 0) {
+    ctx.save(); ctx.translate(960, 760); ctx.scale(up, up);
+    ctx.font = `700 38px ${BODY}`; const tw = ctx.measureText('earnpace.com').width, pw = tw + 140;
+    ctx.fillStyle = C.deep; ctx.beginPath(); ctx.roundRect(-pw / 2, -42, pw, 84, 42); ctx.fill();
+    ctx.fillStyle = '#fff'; ctx.globalAlpha = P(t, 17.15, 17.45);
+    ctx.fillText('earnpace.com', -pw / 2 + 44, 13);
+    ctx.fillStyle = C.accent; ctx.beginPath(); ctx.arc(pw / 2 - 48, 0, 22, 0, 7); ctx.fill();
+    ctx.strokeStyle = C.deep; ctx.lineWidth = 5; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    const ax = pw / 2 - 48 + 4 * Math.sin(Math.max(0, t - 17.5) * 4);
+    ctx.beginPath(); ctx.moveTo(ax - 9, 0); ctx.lineTo(ax + 8, 0); ctx.moveTo(ax + 1, -8); ctx.lineTo(ax + 9, 0); ctx.lineTo(ax + 1, 8); ctx.stroke();
+    ctx.restore();
+  }
+  ctx.restore();
+  // reveal edge ring
+  if (rp < 1) { ctx.strokeStyle = C.accent; ctx.lineWidth = 18 * (1 - rp); ctx.beginPath(); ctx.arc(ox, oy, rad, 0, 7); ctx.stroke(); }
+}
+
+// ---- finishing: vignette + grain ------------------------------------------------
+const GRAIN = Array.from({ length: 6 }, (_, k) => {
+  const cv = document.createElement('canvas'); cv.width = 960; cv.height = 540;
+  const g = cv.getContext('2d'), id = g.createImageData(960, 540), r = rng(100 + k);
+  for (let i = 0; i < id.data.length; i += 4) { const v = r() * 255; id.data[i] = id.data[i + 1] = id.data[i + 2] = v; id.data[i + 3] = 255; }
+  g.putImageData(id, 0, 0); return cv;
+});
+function finish(ctx, t) {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  const light = eInOut3(P(t, 14.9, 15.45));
+  const v = ctx.createRadialGradient(960, 540, 500, 960, 540, 1250);
+  v.addColorStop(0, 'rgba(0,0,0,0)'); v.addColorStop(1, `rgba(0,0,0,${lerp(.5, .08, light)})`);
+  ctx.fillStyle = v; ctx.fillRect(0, 0, W, H);
+  ctx.globalAlpha = lerp(.07, .045, light); ctx.globalCompositeOperation = 'overlay';
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(GRAIN[Math.floor(t * FPS) % GRAIN.length], 0, 0, W, H);
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
+}
+
+// ---- compose ----------------------------------------------------------------------
+function drawScene(ctx, t) {
+  const c = cam(t);
+  background(ctx, t, c);
+  chart(ctx, t, c);
+  scene1(ctx, t);
+  const dot = dotWorld(t);
+  theLine(ctx, t, c, dot);
+  stairIcons(ctx, t, c);
+  texts(ctx, t);
+  const o = drawDot(ctx, t, c) || [1590, 184];
+  scene5(ctx, t, o);
+}
+
+const canvas = document.getElementById('c'), main = canvas.getContext('2d');
+const sub = document.createElement('canvas'); sub.width = W; sub.height = H; const sctx = sub.getContext('2d');
+// Motion blur: average N subframes across a 180° shutter.
+window.renderFrame = function (t, samples = 4) {
+  const shutter = .5 / FPS;
+  for (let k = 0; k < samples; k++) {
+    const st = t + (samples > 1 ? (k / (samples - 1) - .5) * shutter : 0);
+    sctx.save(); drawScene(sctx, clamp(st, 0, DUR)); sctx.restore();
+    main.globalAlpha = 1 / (k + 1); main.drawImage(sub, 0, 0);
+  }
+  main.globalAlpha = 1;
+  finish(main, t);
+};
+window.DUR = DUR; window.FPS = FPS;
+window.ready = document.fonts.load(`900 100px "Inter Display"`).then(() => Promise.all([
+  document.fonts.load(`700 50px Inter`), document.fonts.load(`500 50px Inter`), document.fonts.load(`800 30px Inter`), document.fonts.load(`700 74px "Inter Display"`)]));
+
+if (location.search.includes('play')) {
+  window.ready.then(() => { const s = performance.now(); const loop = () => { renderFrame(((performance.now() - s) / 1000) % DUR, 1); requestAnimationFrame(loop); }; loop(); });
+}
+</script>
+</body>
+</html>
